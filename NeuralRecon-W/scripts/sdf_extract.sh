@@ -10,7 +10,7 @@ config_file=$2
 ckpt_path=$3
 eval_level=$4
 
-python -m torch.distributed.launch --nproc_per_node=4  tools/extract_mesh.py \
+python -m torch.distributed.launch --nproc_per_node=1  tools/extract_mesh.py \
 --cfg_path ${config_file} \
 --mesh_size 1024 --chunk 102144 \
 --ckpt_path $ckpt_path \

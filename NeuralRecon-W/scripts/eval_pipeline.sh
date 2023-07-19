@@ -5,9 +5,9 @@ jobname="eval-$now"
 
 #################################################
 # change these according to your machine status
-N_GPUS=4
-N_CPUS=4
-export CUDA_VISIBLE_DEVICES=0,2,5,6
+N_GPUS=1
+N_CPUS=16
+export CUDA_VISIBLE_DEVICES=0
 ##################################################
 
 scene_name=$1
