@@ -3,6 +3,18 @@ from yacs.config import CfgNode as CN
 
 _CN = CN()
 
+##############  ↓  LIGHT-NEUS-W Pipeline  ↓  ##############
+_CN.LIGHTNEUCONW=CN()
+
+_CN.LIGHTNEUCONW.LIGHT_CONFIG = CN()
+_CN.LIGHTNEUCONW.LIGHT_CONFIG.layers=8
+_CN.LIGHTNEUCONW.LIGHT_CONFIG.hidden=256
+_CN.LIGHTNEUCONW.LIGHT_CONFIG.skips=[4]
+_CN.LIGHTNEUCONW.LIGHT_CONFIG.in_channels_xyz=63
+_CN.LIGHTNEUCONW.LIGHT_CONFIG.in_channels_dir=27
+_CN.LIGHTNEUCONW.LIGHT_CONFIG.in_channels_a=48
+_CN.LIGHTNEUCONW.LIGHT_CONFIG.in_channels_t=16
+
 ##############  ↓  NEUS-W Pipeline  ↓  ##############
 _CN.NEUCONW = CN()
 _CN.NEUCONW.N_SAMPLES = 512
