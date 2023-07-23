@@ -14,6 +14,8 @@ _CN.LIGHTNEUCONW.LIGHT_CONFIG.in_channels_xyz=63
 _CN.LIGHTNEUCONW.LIGHT_CONFIG.in_channels_dir=27
 _CN.LIGHTNEUCONW.LIGHT_CONFIG.in_channels_a=48
 _CN.LIGHTNEUCONW.LIGHT_CONFIG.in_channels_t=16
+_CN.LIGHTNEUCONW.LIGHT_CONFIG.N_emb_xyz=10,
+_CN.LIGHTNEUCONW.LIGHT_CONFIG.N_emb_dir=4 
 
 ##############  ↓  NEUS-W Pipeline  ↓  ##############
 _CN.NEUCONW = CN()
