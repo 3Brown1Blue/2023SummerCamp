@@ -4,72 +4,45 @@ import torch.nn.functional as F
 import numpy as np
 from collections import OrderedDict
 
-from neuconw import SDFNetwork,SingleVarianceNetwork
+from models.neuconw import SDFNetwork,SingleVarianceNetwork
 
-class Embedder:
-    def __init__(self, **kwargs):
-        self.kwargs = kwargs
-        self.create_embedding_fn()
+# xyz and dir embedding
+class PosEmbedding(nn.Module):
+    def __init__(self, max_logscale, N_freqs, logscale=True):
+        super().__init__()
+        self.funcs = [torch.sin, torch.cos]
 
-    def create_embedding_fn(self):
-        embed_fns = []
-        d = self.kwargs["input_dims"]
-        out_dim = 0
-        if self.kwargs["include_input"]:
-            embed_fns.append(lambda x: x)
-            out_dim += d
-
-        max_freq = self.kwargs["max_freq_log2"]
-        N_freqs = self.kwargs["num_freqs"]
-
-        if self.kwargs["log_sampling"]:
-            freq_bands = 2.0 ** torch.linspace(0.0, max_freq, N_freqs)
+        if logscale:
+            self.freqs = 2**torch.linspace(0, max_logscale, N_freqs)
         else:
-            freq_bands = torch.linspace(2.0**0.0, 2.0**max_freq, N_freqs)
+            self.freqs = torch.linspace(1, 2**max_logscale, N_freqs)
 
-        for freq in freq_bands:
-            for p_fn in self.kwargs["periodic_fns"]:
-                embed_fns.append(lambda x, p_fn=p_fn, freq=freq: p_fn(x * freq))
-                out_dim += d
+    def forward(self, x):
+        # dim_in:(B,3)
+        out = [x]
 
-        self.embed_fns = embed_fns
-        self.out_dim = out_dim
+        for freq in self.freqs:
+            for func in self.funcs:
+                out += [func(freq*x)]
 
-    def embed(self, inputs):
-        return torch.cat([fn(inputs) for fn in self.embed_fns], -1)
-
-
-def get_embedder(multires, input_dims=3):
-    embed_kwargs = {
-        "include_input": True,
-        "input_dims": input_dims,
-        "max_freq_log2": multires - 1,
-        "num_freqs": multires,
-        "log_sampling": True,
-        "periodic_fns": [torch.sin, torch.cos],
-    }
-
-    embedder_obj = Embedder(**embed_kwargs)
-
-    def embed(x, eo=embedder_obj):
-        return eo.embed(x)
-
-    return embed, embedder_obj.out_dim
+        # dim_out:(B, 6*N_freqs+3)
+        return torch.cat(out, -1)
 
 class LightCodeNetwork(nn.Module):
     def __init__(
             self,
             flag,
+            encode_appearance=False, 
+            encode_transient=False, 
             layers=8, 
             hidden=256, 
             skips=[4],
             in_channels_xyz=63, 
             in_channels_dir=27,
-            encode_appearance=False, 
             in_channels_a=48,
-            encode_transient=False, 
             in_channels_t=16,
-            beta_min=0.03 
+            N_emb_xyz=10,
+            N_emb_dir=4 
         ):
         super().__init__()
         self.flag=flag
@@ -82,13 +55,17 @@ class LightCodeNetwork(nn.Module):
         if flag=='fine':
             self.encode_appearance=encode_appearance
             self.encode_transient=encode_transient
-            self.inchannels_a=in_channels_a
-            self.inchannels_t=in_channels_t
+            self.in_channels_a=in_channels_a
+            self.in_channels_t=in_channels_t
         else:
             self.encode_appearance=False
             self.encode_transient=False
-            self.inchannels_a=0
-            self.inchannels_t=0
+            self.in_channels_a=0
+            self.in_channels_t=0
+        
+        # points & views embedding
+        self.xyz_embedding=PosEmbedding(N_emb_xyz-1,N_emb_xyz)
+        self.dir_embedding=PosEmbedding(N_emb_dir-1,N_emb_dir)
 
         ## static 
         # xyz-encoder
@@ -125,18 +102,12 @@ class LightCodeNetwork(nn.Module):
             self.transient_rgb = nn.Sequential(nn.Linear(hidden//2, 3), nn.Sigmoid())
             self.transient_beta = nn.Sequential(nn.Linear(hidden//2, 1), nn.Softplus())
 
-    def forward(self, x,output_transient=True):
+    def forward(self,input_xyz,views,input_a,input_t=None,output_transient=False):
         # output the transient code or not
-        if output_transient:
-            input_xyz, input_dir_a, input_t = \
-                torch.split(x, [self.in_channels_xyz,
-                                self.in_channels_dir+self.in_channels_a,
-                                self.in_channels_t], dim=-1)
-        else:
-            input_xyz, input_dir_a = \
-                torch.split(x, [self.in_channels_xyz,
-                                self.in_channels_dir+self.in_channels_a], dim=-1)
-
+        input_xyz=self.xyz_embedding(input_xyz)
+        views=self.dir_embedding(views)
+        input_dir_a=torch.cat([views,input_a],dim=-1)
+        
         xyz_copy = input_xyz
         for i in range(self.layers):
             if i in self.skips:
@@ -149,10 +120,9 @@ class LightCodeNetwork(nn.Module):
         dir_encoding_input = torch.cat([xyz_encoding_final, input_dir_a], 1)
         dir_encoding = self.dir_encoder(dir_encoding_input)
         static_rgb = self.static_rgb(dir_encoding) # B*3
-        static = torch.cat([static_rgb, static_sigma], 1)
 
         if not output_transient:
-            return static
+            return static_sigma,static_rgb
 
         transient_encoding_input = torch.cat([xyz_encoding_final, input_t], 1)
         transient_encoding = self.transient_encoder(transient_encoding_input)
@@ -160,10 +130,7 @@ class LightCodeNetwork(nn.Module):
         transient_rgb = self.transient_rgb(transient_encoding) # B*3
         transient_beta = self.transient_beta(transient_encoding) # B*1
 
-        transient = torch.cat([transient_rgb, transient_sigma,
-                               transient_beta], 1) 
-
-        return torch.cat([static, transient], 1) 
+        return static_sigma,static_rgb,transient_sigma,transient_beta,transient_rgb
       
 
 class LightNeuconW(nn.Module):
@@ -193,12 +160,15 @@ class LightNeuconW(nn.Module):
 
         # (static & transient) Light code and color based on Nerf-W
         # optimize 2 models at same time
-        self.lightcode_net_coarse = LightCodeNetwork(
-            flag='coarse',
-            **self.lightcodeNet_config
-        )
+
+        # self.lightcode_net_coarse = LightCodeNetwork(
+        #     flag='coarse',
+        #     **self.lightcodeNet_config
+        # )
         self.lightcode_net_fine = LightCodeNetwork(
             flag='fine',
+            encode_appearance=True, 
+            encode_transient=False,
             **self.lightcodeNet_config
         )
 
@@ -212,12 +182,12 @@ class LightNeuconW(nn.Module):
 
     def forward(self, x):
         device = x.device
-        input_xyz, view_dirs, input_dir_a = torch.split(
+        input_xyz, view_dirs, input_a = torch.split(
             x, [3, 3, self.in_channels_a], dim=-1
         )
-
+        
         n_rays, n_samples, _ = input_xyz.size()
-        input_dir_a = input_dir_a.view(n_rays * n_samples, -1)
+        input_a = input_a.view(n_rays * n_samples, -1)
 
         # geometry prediction
         sdf_nn_output = self.sdf_net(input_xyz)  # (B, 1), (B, W)
@@ -226,13 +196,12 @@ class LightNeuconW(nn.Module):
 
         # color prediction
         static_gradient = self.gradient(input_xyz)
-        static_rgb, xyz_encoding_final, view_encoded = self.lightcode_net_net(
-            input_xyz.view(-1, 3),
-            static_gradient.view(-1, 3),
-            view_dirs.view(-1, 3),
-            xyz_,
-            input_dir_a,
+        static_sigma,static_rgb  = self.lightcode_net_fine(
+            input_xyz.view(-1,3),
+            view_dirs.view(-1,3),
+            input_a
         )  # (B, 3)
+
         # sdf gradient
         static_deviation = self.deviation_network(torch.zeros([1, 3], device=device))[
             :, :1
