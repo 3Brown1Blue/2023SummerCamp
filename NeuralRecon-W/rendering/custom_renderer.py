@@ -790,6 +790,7 @@ class LightNeuconWRenderer:
         perturb_overwrite=-1,
         background_rgb=None,
         cos_anneal_ratio=0.0,
+        a_embedded=None
     ):
         device = rays.device
 
@@ -817,7 +818,8 @@ class LightNeuconWRenderer:
         rays_o = (rays_o / self.radius).float()
         depth_gt = (depth_gt / self.radius).float()
 
-        a_embedded = self.embeddings["a"](ts)
+        if a_embedded is None:
+            a_embedded = self.embeddings["a"](ts)
 
         perturb = self.perturb
         if perturb_overwrite >= 0:
@@ -913,6 +915,7 @@ class LightNeuconWRenderer:
             "floor_normal_error": floor_normal_error,
             "floor_y_error": floor_y_error,
             "sfm_depth_loss": sfm_depth_loss,
+            "a_embedded":a_embedded
         }
 
     def floor_loss(self, label, normals, rays_o, rays_d, rendered_depth):
