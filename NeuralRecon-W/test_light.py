@@ -137,23 +137,55 @@ def main(hparams,config):
             )
     
     # prepare data
-    sample=dataset[0]
-    rays=sample['rays'].cuda()
-    ts=sample['ts'].cuda()
-    rgbs=sample['rgbs']
-    label=sample['semantics'].cuda()
+    interpolate=2
+    sample1=dataset[53]
+    sample2=dataset[111]
 
-    print("start to inference!")
-    
-    results=inference(rays,ts,label)
-    
-    img_shape = tuple(sample['img_wh'].numpy())
-    img_pred=results['color'].view(img_shape[1],img_shape[0],3).cpu().detach().numpy()
-    img_gt=rgbs.view(img_shape[1],img_shape[0],3)
+    rays1=sample1['rays'].cuda()
+    ts1=sample1['ts'].cuda()
+    label1=sample1['semantics'].cuda()
+    rays2=sample2['rays'].cuda()
+    ts2=sample2['ts'].cuda()
+    label2=sample2['semantics'].cuda()
 
-    # no monitor,save results
-    plt.imsave('pred.jpg',img_pred)
-    plt.imsave('gt.jpg',img_gt)
+    results1=inference(rays1,ts1,label1)
+    a_embedded1=results1['a_embedded']
+    results2=inference(rays2,ts2,label2)
+    a_embedded2=results2['a_embedded']
+
+    # use light code to control rendering
+    print("<------start to inference------>")
+    results=[]
+    results+=[sample1]
+    for i in range(interpolate):
+        a_embedded=i/(interpolate+1)*a_embedded1+(1-i/(interpolate+1))*a_embedded2
+        results+=[inference(rays1,ts1,label1,a_embedded)]
+    results+=[sample2]
+
+    # plot
+    fig,axes=plt.subplots(1,4,figsize=(20, 10),tight_layout=True)
+    for i in range(interpolate+2):
+        if i==0:
+            img_shape=tuple(results[0]['img_wh'].numpy())
+            rgbs=results[0]['rgbs']
+            img=rgbs.view(img_shape[1],img_shape[0],3).numpy()
+            axes[0,0].imshow(img)
+            axes[0,0].axis('off')
+            axes.title('sample1')
+        elif i==interpolate+1:
+            img_shape=tuple(results[interpolate+1]['img_wh'].numpy())
+            rgbs=results[interpolate+1]['rgbs']
+            img=rgbs.view(img_shape[1],img_shape[0],3).numpy()
+            axes[0,interpolate+1].imshow(img)
+            axes[0,interpolate+1].axis('off')
+            axes.title('sample2')
+        else:
+            img_shape=tuple(results[0]['img_wh'].numpy())
+            img=results[i]['color'].view(img_shape[1],img_shape[0],3).cpu().detach().numpy()
+            axes[0,i].imshow(img)
+            axes[0,i].axis('off')
+            
+    fig.savefig('interpolate.jpg')
 
 if __name__ == '__main__':
     hparams = get_opts()
