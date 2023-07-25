@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 import metrics
 import yaml
 
+from tqdm import tqdm
 from collections import defaultdict
 from argparse import ArgumentParser
 
@@ -29,8 +30,8 @@ def get_opts():
                         help='number of gpus')
     parser.add_argument('--num_workers',type=int,default=4,
                         help='number of workers')
-    parser.add_argument('--chunk', type=int, default=1024*16,
-                        help='chunk size')
+    parser.add_argument('--chunks', type=int, default=32,
+                        help='chunk size(avoid OOM)')
     parser.add_argument('--N_vocab',type=int,default=5000,
                         help='vocab size')
     parser.add_argument('encode_transient',default=False,action='store_true',
@@ -109,17 +110,22 @@ def main(hparams,config):
     )
 
     # get rendered image
-    def inference(rays,ts,label):
+    def inference(rays,ts,label,a_embedded):
         results=defaultdict(list)
-        rendered_ray_chunks=renderer.render(
-            rays,
-            ts,
-            label,
-            background_rgb=torch.zeros([1, 3], device=rays.device),
-        )
-        
-        for k,v in rendered_ray_chunks.items():
-            results[k]+=[v]
+        B=rays.shape[0]
+        chunks=hparams.chunks
+
+        # split input into chunks to avoid CUDA OOM
+        for i in tqdm(range(0,B,chunks)):
+            rendered_ray_chunks=renderer.render(
+                rays[i:i+chunks],
+                ts[i:i+chunks],
+                label[i:i+chunks],
+                background_rgb=torch.zeros([1, 3], device=rays.device),
+                a_embedded=a_embedded[i:i+chunks]
+            )
+            for k,v in rendered_ray_chunks.items():
+                results[k]+=[v]
         
         for k,v in results.items():
             results[k]=torch.cat(v,dim=0)
@@ -137,53 +143,47 @@ def main(hparams,config):
             )
     
     # prepare data
-    interpolate=2
+    interpolate=1
     sample1=dataset[53]
-    sample2=dataset[111]
+    sample2=dataset[106]
 
+    # only load rays of sample1 to save Memory
     rays1=sample1['rays'].cuda()
     ts1=sample1['ts'].cuda()
     label1=sample1['semantics'].cuda()
-    rays2=sample2['rays'].cuda()
-    ts2=sample2['ts'].cuda()
-    label2=sample2['semantics'].cuda()
-
-    results1=inference(rays1,ts1,label1)
-    a_embedded1=results1['a_embedded']
-    results2=inference(rays2,ts2,label2)
-    a_embedded2=results2['a_embedded']
+    a_embedded1=embedding_a(ts1)
+    a_embedded2=embedding_a(sample2['ts'][0].cuda())
 
     # use light code to control rendering
     print("<------start to inference------>")
     results=[]
     results+=[sample1]
     for i in range(interpolate):
+        print(f"step:{i}")
         a_embedded=i/(interpolate+1)*a_embedded1+(1-i/(interpolate+1))*a_embedded2
         results+=[inference(rays1,ts1,label1,a_embedded)]
     results+=[sample2]
 
     # plot
-    fig,axes=plt.subplots(1,4,figsize=(20, 10),tight_layout=True)
+    fig,axes=plt.subplots(1,3,figsize=(20, 10),tight_layout=True)
     for i in range(interpolate+2):
         if i==0:
             img_shape=tuple(results[0]['img_wh'].numpy())
             rgbs=results[0]['rgbs']
             img=rgbs.view(img_shape[1],img_shape[0],3).numpy()
-            axes[0,0].imshow(img)
-            axes[0,0].axis('off')
-            axes.title('sample1')
+            axes[0].imshow(img)
+            axes[0].axis('off')
         elif i==interpolate+1:
             img_shape=tuple(results[interpolate+1]['img_wh'].numpy())
             rgbs=results[interpolate+1]['rgbs']
             img=rgbs.view(img_shape[1],img_shape[0],3).numpy()
-            axes[0,interpolate+1].imshow(img)
-            axes[0,interpolate+1].axis('off')
-            axes.title('sample2')
+            axes[interpolate+1].imshow(img)
+            axes[interpolate+1].axis('off')
         else:
             img_shape=tuple(results[0]['img_wh'].numpy())
             img=results[i]['color'].view(img_shape[1],img_shape[0],3).cpu().detach().numpy()
-            axes[0,i].imshow(img)
-            axes[0,i].axis('off')
+            axes[i].imshow(img)
+            axes[i].axis('off')
             
     fig.savefig('interpolate.jpg')
 
