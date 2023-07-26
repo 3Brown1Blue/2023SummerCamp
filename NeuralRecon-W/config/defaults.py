@@ -3,18 +3,26 @@ from yacs.config import CfgNode as CN
 
 _CN = CN()
 
+##############  ↓  NERF-OSR Pipeline  ↓  ##############
+_CN.NERFOSR=CN()
+
 ##############  ↓  LIGHT-NEUS-W Pipeline  ↓  ##############
 _CN.LIGHTNEUCONW=CN()
 
 _CN.LIGHTNEUCONW.LIGHT_CONFIG = CN()
+_CN.LIGHTNEUCONW.LIGHT_CONFIG.flag="fine"
+_CN.LIGHTNEUCONW.LIGHT_CONFIG.encode_shadow=True
+_CN.LIGHTNEUCONW.LIGHT_CONFIG.encode_appearance=True
+_CN.LIGHTNEUCONW.LIGHT_CONFIG.encode_transient=False
 _CN.LIGHTNEUCONW.LIGHT_CONFIG.layers=8
 _CN.LIGHTNEUCONW.LIGHT_CONFIG.hidden=256
 _CN.LIGHTNEUCONW.LIGHT_CONFIG.skips=[4]
 _CN.LIGHTNEUCONW.LIGHT_CONFIG.in_channels_xyz=63
 _CN.LIGHTNEUCONW.LIGHT_CONFIG.in_channels_dir=27
 _CN.LIGHTNEUCONW.LIGHT_CONFIG.in_channels_a=48
+_CN.LIGHTNEUCONW.LIGHT_CONFIG.in_channels_sph=9
 _CN.LIGHTNEUCONW.LIGHT_CONFIG.in_channels_t=16
-_CN.LIGHTNEUCONW.LIGHT_CONFIG.N_emb_xyz=10,
+_CN.LIGHTNEUCONW.LIGHT_CONFIG.N_emb_xyz=10
 _CN.LIGHTNEUCONW.LIGHT_CONFIG.N_emb_dir=4 
 
 ##############  ↓  NEUS-W Pipeline  ↓  ##############
