@@ -79,11 +79,11 @@ class LightCodeNetwork(nn.Module):
             l=nn.Sequential(l,nn.ReLU(inplace=True))
             setattr(self,f"xyz_encoder_{i+1}",l)
         self.xyz_encoder_final=nn.Linear(hidden,hidden)
-
-         # direction-encoder
-        self.dir_encoder = nn.Sequential(
-                                nn.Linear(hidden+in_channels_dir+self.in_channels_a, hidden//2), 
-                                nn.ReLU(True))
+        
+        # direction&appearance-encoder
+        dir_a_encoder=[[nn.Linear(hidden+in_channels_dir+self.in_channels_a, hidden//2),nn.ReLU(True)]]+ \
+                    [[nn.Linear(hidden//2,hidden//2),nn.ReLU(True)] for _ in range(layers//2)]
+        self.dir_a_encoder=nn.Sequential(*sum(dir_a_encoder,[]))
 
         # static output layers
         self.static_sigma = nn.Sequential(nn.Linear(hidden, 1), nn.Softplus())
@@ -117,9 +117,9 @@ class LightCodeNetwork(nn.Module):
         static_sigma = self.static_sigma(xyz_copy) # B*1
 
         xyz_encoding_final = self.xyz_encoder_final(xyz_copy)
-        dir_encoding_input = torch.cat([xyz_encoding_final, input_dir_a], 1)
-        dir_encoding = self.dir_encoder(dir_encoding_input)
-        static_rgb = self.static_rgb(dir_encoding) # B*3
+        rgb_input = torch.cat([xyz_encoding_final, input_dir_a], 1)
+        rgb_input = self.dir_a_encoder(rgb_input)
+        static_rgb = self.static_rgb(rgb_input) # B*3
 
         if not output_transient:
             return static_sigma,static_rgb
@@ -131,7 +131,23 @@ class LightCodeNetwork(nn.Module):
         transient_beta = self.transient_beta(transient_encoding) # B*1
 
         return static_sigma,static_rgb,transient_sigma,transient_beta,transient_rgb
-      
+
+
+'''
+    NeRFOSR: recurrented from paper {NeRF for Outdoor Scene Relighting},ECCV 2022  
+    url:https://4dqv.mpi-inf.mpg.de/NeRF-OSR/  
+    composition:  
+    ShadowNet------------------->  
+    |                           |  
+    NeRFBase(LightCodeNetwork)——DensityNet------>(merge) ---> Output  
+    |                           |  
+    AlbedoNet------------------->  
+'''
+class NeRFOSR(nn.Module):
+    def __init__(self) :
+        super().__init__()
+
+
 
 class LightNeuconW(nn.Module):
     def __init__(
@@ -171,6 +187,7 @@ class LightNeuconW(nn.Module):
             encode_transient=False,
             **self.lightcodeNet_config
         )
+
 
     def sdf(self, input_xyz):
         # geometry prediction
