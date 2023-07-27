@@ -240,7 +240,7 @@ class LightNeuconW(nn.Module):
             input_xyz.view(-1,3),
             view_dirs.view(-1,3),
             input_a,
-            input_sph
+            input_sph.view(-1,9)
         )  # (B, 1+3+3)
 
         # sdf gradient
@@ -255,6 +255,8 @@ class LightNeuconW(nn.Module):
             static_deviation,
             static_sdf.view(n_rays, n_samples),
             static_gradient.view(n_rays, n_samples, 3),
+            static_sigma.view(n_rays,n_samples),
+            shadow.view(n_rays,n_samples,1)
         )
 
         return static_out
