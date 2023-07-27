@@ -566,6 +566,47 @@ class LightNeuconWRenderer:
             z_vals, index = torch.sort(z_vals, dim=-1)
 
         return n_samples, z_vals, z_vals_outside, sample_dist
+    
+    # borrowed from NeRF-OSR,github:"https://github.com/r00tman/NeRF-OSR"
+    def intersect_sphere(self,ray_o, ray_d):
+        '''
+        ray_o, ray_d: [..., 3]
+        compute the depth of the intersection point between this ray and unit sphere
+        '''
+        # note: d1 becomes negative if this mid point is behind camera
+        d1 = -torch.sum(ray_d * ray_o, dim=-1) / torch.sum(ray_d * ray_d, dim=-1)
+        p = ray_o + d1.unsqueeze(-1) * ray_d
+        # consider the case where the ray does not intersect the sphere
+        ray_d_cos = 1. / torch.norm(ray_d, dim=-1)
+        p_norm_sq = torch.sum(p * p, dim=-1)
+        if (p_norm_sq >= 1.).any():
+            raise Exception(
+                'Not all your cameras are bounded by the unit sphere; please make sure the cameras are normalized properly!')
+        d2 = torch.sqrt(1. - p_norm_sq) * ray_d_cos
+
+        return d1 + d2
+    def illuminate_vec(n, env):
+        c1 = 0.282095
+        c2 = 0.488603
+        c3 = 1.092548
+        c4 = 0.315392
+        c5 = 0.546274
+
+        c = env.unsqueeze(1)
+        x, y, z = n[..., 0, None], n[..., 1, None], n[..., 2, None]
+
+        irradiance = (
+            c[0] * c1 +
+            c[1] * c2*y +
+            c[2] * c2*z +
+            c[3] * c2*x +
+            c[4] * c3*x*y +
+            c[5] * c3*y*z +
+            c[6] * c4*(3*z*z-1) +
+            c[7] * c3*x*z +
+            c[8] * c5*(x*x-y*y)
+        )
+        return irradiance
 
     def render_core(
         self,
@@ -602,13 +643,83 @@ class LightNeuconWRenderer:
         )  # N_rays, N_samples, c
         rays_d_ = rays_d.unsqueeze(1).expand(-1, n_samples, -1)  # N_rays, N_samples, c
 
-        # inputs for NeuconW
-        inputs = [pts_, rays_d_]
-        inputs += [a_embedded_]
+        ### foreground far depth
+        z_max=self.intersect_sphere(rays_o,rays_d)
+
+        ### default env
+        env = torch.tensor([
+                [2.9861e+00, 3.4646e+00, 3.9559e+00],
+                [1.0013e-01, -6.7589e-02, -3.1161e-01],
+                [-8.2520e-01, -5.2738e-01, -9.7385e-02],
+                [2.2311e-03, 4.3553e-03, 4.9501e-03],
+                [-6.4355e-03, 9.7476e-03, -2.3863e-02],
+                [ 1.1078e-01, -6.0607e-02, -1.9541e-01],
+                [7.9123e-01, 7.6916e-01, 5.6288e-01],
+                [ 6.5793e-02,  4.3270e-02, -1.7002e-01],
+                [-7.2674e-02, 4.5177e-02, 2.2858e-01]
+
+                # [1.3242, 1.2883, 1.2783],
+                # [0.0256, 0.0296, 0.0315],
+                # [0.0376, 0.0362, 0.0390],
+                # [0.0057, 0.0016, 0.0027],
+                # [-0.0066, -0.0036, -0.0015],
+                # [-0.0329, -0.0395, -0.0416],
+                # [-0.0350, -0.0316, -0.0352],
+                # [0.0038, 0.0042, 0.0019],
+                # [0.0124, 0.0130, 0.0108]
+
+                # [0.7953949, 0.4405923, 0.5459412],
+                # [0.3981450, 0.3526911, 0.6097158],
+                # [-0.3424573, -0.1838151, -0.2715583],
+                # [-0.2944621, -0.0560606, 0.0095193],
+                # [-0.1123051, -0.0513088, -0.1232869],
+                # [-0.2645007, -0.2257996, -0.4785847],
+                # [-0.1569444, -0.0954703, -0.1485053],
+                # [0.5646247, 0.2161586, 0.1402643],
+                # [0.2137442, -0.0547578, -0.3061700]
+            ], dtype=torch.float32)
+        env_gray=env[..., 0]*0.2126 + env[..., 1]*0.7152 + env[..., 2]*0.0722
+
+        # get sph for shadows
+        sph=env_gray.view(9).unsqueeze(0).unsqueeze(0).expand([batch_size,n_samples,9])
+        sph=sph+torch.randn_like(sph)*0.01
+        
+        ##### inputs for LightNeuconW
+        inputs=torch.cat((pts_,rays_d_,a_embedded_,sph),dim=-1)
+        
         # print([it.size() for it in inputs])
 
+        ##### output of LightNeuconW
         static_out = self.lightneuconw(torch.cat(inputs, -1))
-        rgb, inv_s, sdf, gradients = static_out
+        rgb, inv_s, sdf, gradients , sigma , shadow= static_out
+
+        ##### output of NeRF-OSR
+        fg_normal_map = torch.autograd.grad(
+                outputs=sigma,
+                inputs=pts_,
+                grad_outputs=torch.ones_like(sigma, requires_grad=False),
+                retain_graph=True,
+                create_graph=True)[0]
+        fg_alpha = 1. - torch.exp(-sigma * dists)  # [..., N_samples]
+        T = torch.cumprod(1. - fg_alpha + 1e-6, dim=-1)  # [..., N_samples]
+        bg_lambda = T[..., -1]
+        T = torch.cat((torch.ones_like(T[..., 0:1]), T[..., :-1]), dim=-1)  # [..., N_samples]
+        fg_weights = fg_alpha * T  # [..., N_samples]
+
+        fg_albedo_map = torch.sum(fg_weights.unsqueeze(-1) * rgb, dim=-2)  # [..., 3]
+        fg_shadow_map = torch.sum(fg_weights.unsqueeze(-1) * shadow, dim=-2)  # [..., 3]
+
+        fg_depth_map = torch.sum(fg_weights * z_vals, dim=-1) 
+        fg_normal_map = (fg_normal_map * fg_weights.unsqueeze(-1)).mean(-2)
+        fg_normal_map = F.normalize(fg_normal_map, p=2, dim=-1)
+
+        # foreground color map
+        irradiance = self.illuminate_vec(fg_normal_map, env)
+        irradiance = torch.relu(irradiance)  # can't be < 0
+        irradiance = irradiance ** (1 / 2.2)  # linear to srgb
+        fg_pure_rgb_map = irradiance * fg_albedo_map
+        fg_rgb_map = fg_pure_rgb_map * fg_shadow_map
+
 
         true_cos = (dirs * gradients.reshape(-1, 3)).sum(-1, keepdim=True)
 
@@ -751,7 +862,7 @@ class LightNeuconWRenderer:
         color = (rgb * weights[:, :, None]).sum(dim=1)
 
         if background_rgb is not None:  # Fixed background, usually black
-            color = color + background_rgb * (1.0 - weights_sum)
+            color = fg_rgb_map + background_rgb * (1.0 - weights_sum)
 
         # Eikonal loss
         gradient_error = (
