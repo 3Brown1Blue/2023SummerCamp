@@ -3,6 +3,12 @@ from yacs.config import CfgNode as CN
 
 _CN = CN()
 
+##############  ↓  NERF-OSR Pipeline  ↓  ##############
+_CN.NERFOSR=CN()
+_CN.NERFOSR.use_shadow=True
+_CN.NERFOSR.use_albedo=True
+_CN.NERFOSR.use_normal=True
+
 ##############  ↓  LIGHT-NEUS-W Pipeline  ↓  ##############
 _CN.LIGHTNEUCONW=CN()
 
@@ -115,7 +121,7 @@ _CN.TRAINER.SAVE_FREQ = 5000
 
 # optimizer
 _CN.TRAINER.OPTIMIZER = "adam"
-_CN.TRAINER.LR = None  # this will be calculated automatically at runtime when train
+_CN.TRAINER.LR = 1e-4  # this will be calculated automatically at runtime when train
 _CN.TRAINER.WEIGHT_DECAY = 0  # adam weight decay
 
 # step-based warm-up, , only applied when optimizer == 'adam'

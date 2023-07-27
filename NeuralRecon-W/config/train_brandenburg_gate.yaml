@@ -81,9 +81,10 @@ TRAINER:
   CANONICAL_LR: 1e-4
 
   OPTIMIZER: "adam" 
+  LR: 5e-5
   WEIGHT_DECAY: 0 
 
-  LR_SCHEDULER: 'none'
+  LR_SCHEDULER: 'cosine'
   SAVE_DIR: './checkpoints'
   VAL_FREQ: 10000.0
   SAVE_FREQ: 10000
