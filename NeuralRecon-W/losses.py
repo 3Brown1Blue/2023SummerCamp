@@ -42,4 +42,52 @@ class NeuconWLoss(nn.Module):
 
         return ret
 
-loss_dict = {'neuconw': NeuconWLoss}
+class LightNeuconWLoss(nn.Module):
+    """
+    Equation 13 in the NeRF-W paper.
+    Name abbreviations:
+        c_l: coarse color loss
+        f_l: fine color loss (1st term in equation 13)
+        b_l: beta loss (2nd term in equation 13) 
+        s_l: sigma loss (3rd term in equation 13)
+    """
+    def __init__(self, coef=1, lambda_u=0.01,igr_weight=0.1, mask_weight=0.1, 
+                depth_weight=0.1, floor_weight=0.01, config=None):
+        super().__init__()
+        self.coef = coef
+        self.igr_weight = igr_weight
+        self.mask_weight = mask_weight
+        self.depth_weight = depth_weight
+        self.floor_weight = depth_weight
+        self.lambda_u=lambda_u
+
+        self.config = config
+
+    def forward(self, inputs, targets, global_step,masks=None):
+        ret = {}
+        if masks is None:
+                masks = torch.ones((targets.shape[0], 1)).to(targets.device)
+        mask_sum = masks.sum() + 1e-5
+        color_error = (inputs['color'] - targets) * masks
+        ret['color_loss'] = torch.nn.functional.l1_loss(color_error, torch.zeros_like(color_error), reduction='sum') / mask_sum
+        ret['shadow_reg'] = torch.mean((1-inputs['shadow'])**2)*0.01* \
+                            np.clip((global_step-10000)/20000,0,1)
+
+        ret['normal_loss'] = self.igr_weight * inputs['gradient_error'].mean()
+
+        if self.config.NEUCONW.MESH_MASK_LIST is not None:
+            ret['mask_error'] = self.mask_weight * inputs['mask_error'].mean()
+
+        if self.config.NEUCONW.DEPTH_LOSS:
+            ret['sfm_depth_loss'] = self.depth_weight * inputs['sfm_depth_loss'].mean()
+
+        if self.config.NEUCONW.FLOOR_NORMAL:
+            ret['floor_normal_error'] = self.floor_weight * inputs['floor_normal_error'].mean()
+
+        for k, v in ret.items():
+            ret[k] = self.coef * v
+
+        return ret
+
+loss_dict = {'neuconw': NeuconWLoss,
+             'lightneuconw':LightNeuconWLoss}

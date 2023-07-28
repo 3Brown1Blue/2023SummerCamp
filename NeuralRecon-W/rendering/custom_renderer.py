@@ -862,7 +862,7 @@ class LightNeuconWRenderer:
         color = (rgb * weights[:, :, None]).sum(dim=1)
 
         if background_rgb is not None:  # Fixed background, usually black
-            color = fg_rgb_map + background_rgb * (1.0 - weights_sum)
+            color = fg_rgb_map + background_rgb
 
         # Eikonal loss
         gradient_error = (
@@ -878,6 +878,7 @@ class LightNeuconWRenderer:
         return {
             "color": color,
             "color_sphere": color_sphere,
+            "shadow":fg_shadow_map,
             "color_bg": color_bg if color_bg is not None else torch.zeros_like(color),
             "sdf": sdf,
             "dists": dists,

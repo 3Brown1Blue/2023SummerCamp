@@ -336,7 +336,7 @@ class LightNeuconWSystem(LightningModule):
         label = label[ray_mask]
 
         results = self(rays, ts, label)
-        loss_d = self.loss(results, rgbs)
+        loss_d = self.loss(results, rgbs,self.global_step)
         loss = sum(l for l in loss_d.values())
 
         with torch.no_grad():
@@ -409,7 +409,7 @@ class LightNeuconWSystem(LightningModule):
                 results[k] += [v.detach()]
         for k, v in results.items():
             results[k] = torch.cat(v, dim=0)
-        loss_d = self.loss(results, rgbs)
+        loss_d = self.loss(results, rgbs,self.global_step)
         loss = sum(l for l in loss_d.values())
         log = {"val_loss": loss}
 
