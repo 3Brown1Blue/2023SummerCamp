@@ -123,7 +123,7 @@ class LightCodeNetwork(nn.Module):
             self.transient_rgb = nn.Sequential(nn.Linear(hidden//2, 3), nn.Sigmoid())
             self.transient_beta = nn.Sequential(nn.Linear(hidden//2, 1), nn.Softplus())
 
-    def forward(self,input_xyz,views,input_a,input_sph,input_t=None,output_transient=False):
+    def forward(self,input_xyz,views,input_a,input_sph=None,input_t=None,output_transient=False):
         # output the transient code or not
         input_xyz=self.xyz_embedding(input_xyz)
         views=self.dir_embedding(views)
@@ -142,11 +142,12 @@ class LightCodeNetwork(nn.Module):
         rgb_input = self.dir_a_encoder(rgb_input)
         static_rgb = self.static_rgb(rgb_input) # B*3
 
-        shadow=self.shadow_layers(torch.cat([xyz_encoding_final,input_sph],dim=-1))
-        shadow=shadow.repeat((1,)*(len(shadow.size())-1)+(3,))
+        if input_sph is not None:
+            shadow=self.shadow_layers(torch.cat([xyz_encoding_final,input_sph],dim=-1))
+            shadow=shadow.repeat((1,)*(len(shadow.size())-1)+(3,))
 
         if not output_transient:
-            if self.encode_shadow:
+            if self.encode_shadow and input_sph is not None:
                 return static_sigma,static_rgb,shadow
             else:
                 return static_sigma,static_rgb
@@ -256,7 +257,7 @@ class LightNeuconW(nn.Module):
             static_sdf.view(n_rays, n_samples),
             static_gradient.view(n_rays, n_samples, 3),
             static_sigma.view(n_rays,n_samples),
-            shadow.view(n_rays,n_samples,1)
+            shadow.view(n_rays,n_samples,3)
         )
 
         return static_out

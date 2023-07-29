@@ -51,7 +51,7 @@ def sample_pdf(bins, weights, n_samples, det=False):
 class LightNeuconWRenderer:
     def __init__(
         self,
-        nerf,
+        bg_model,
         lightneuconw,
         embeddings,
         n_samples,
@@ -76,7 +76,7 @@ class LightNeuconWRenderer:
         floor_labels=None,
     ):
 
-        self.nerf = nerf
+        self.bg_model = bg_model
         self.lightneuconw = lightneuconw
         self.embeddings = embeddings
 
@@ -153,79 +153,6 @@ class LightNeuconWRenderer:
         octree_data["spc_data"] = spc_data
 
         return octree_data
-
-    def render_core_outside(
-        self,
-        rays_o,
-        rays_d,
-        z_vals,
-        sample_dist,
-        nerf,
-        background_rgb=None,
-        a_embedded=None,
-    ):
-        """
-        Render background
-        """
-        device = rays_o.device
-
-        batch_size, n_samples = z_vals.shape
-
-        # Section length
-        dists = z_vals[..., 1:] - z_vals[..., :-1]
-        dists = torch.cat([dists, sample_dist.expand(dists[..., :1].shape)], -1)
-        mid_z_vals = z_vals + dists * 0.5
-
-        # Section midpoints
-        pts = (
-            rays_o[:, None, :] + rays_d[:, None, :] * mid_z_vals[..., :, None]
-        )  # batch_size, n_samples, 3
-
-        dis_to_center = torch.linalg.norm(pts, ord=2, dim=-1, keepdim=True).clip(
-            1.0, 1e10
-        )
-        pts = torch.cat(
-            [pts / dis_to_center, 1.0 / dis_to_center], dim=-1
-        )  # batch_size, n_samples, 4
-
-        dirs = rays_d[:, None, :].expand(batch_size, n_samples, 3)
-
-        pts = pts.reshape(-1, 3 + int(self.n_outside > 0))
-        dirs = dirs.reshape(-1, 3)
-
-        a_embedded_expand = (
-            a_embedded[:, None, :]
-            .expand(batch_size, n_samples, -1)
-            .reshape(dirs.size()[0], -1)
-            if a_embedded is not None
-            else None
-        )
-
-        density, sampled_color = nerf(pts, dirs, a_embedded_expand)
-        alpha = 1.0 - torch.exp(
-            -F.softplus(density.reshape(batch_size, n_samples)) * dists
-        )
-        alpha = alpha.reshape(batch_size, n_samples)
-        weights = (
-            alpha
-            * torch.cumprod(
-                torch.cat(
-                    [torch.ones([batch_size, 1], device=device), 1.0 - alpha + 1e-7], -1
-                ),
-                -1,
-            )[:, :-1]
-        )
-        sampled_color = sampled_color.reshape(batch_size, n_samples, 3)
-        color = (weights[:, :, None] * sampled_color).sum(dim=1)
-        if background_rgb is not None:
-            color = color + background_rgb * (1.0 - weights.sum(dim=-1, keepdim=True))
-
-        return {
-            "color": color,
-            "sampled_color": sampled_color,
-            "alpha": alpha,
-            "weights": weights,
-        }
 
     def save_samples_step(self, pts, weights, save_name, dir_name="steps"):
         pts_world = (pts * self.radius).view(-1, 3) + self.origin
@@ -613,12 +540,10 @@ class LightNeuconWRenderer:
         rays_o,
         rays_d,
         z_vals,
+        z_vals_outside,
         sample_dist,
         a_embedded,
         cos_anneal_ratio=0,
-        background_alpha=None,
-        background_sampled_color=None,
-        background_rgb=None,
     ):
         batch_size, n_samples = z_vals.shape
         device = rays_o.device
@@ -632,10 +557,12 @@ class LightNeuconWRenderer:
         pts = (
             rays_o[:, None, :] + rays_d[:, None, :] * mid_z_vals[..., :, None]
         )  # n_rays, n_samples, 3
-        dirs = rays_d[:, None, :].expand(pts.shape)
+        ray_d_norm = torch.norm(rays_d, dim=-1, keepdim=True)
+        viewdirs = rays_d/ray_d_norm
+        viewdirs=viewdirs[:, None, :].expand((batch_size, n_samples,3))
 
         pts = pts.reshape(-1, 3)
-        dirs = dirs.reshape(-1, 3)
+        dirs = rays_d[:, None, :].expand((batch_size, n_samples,3))
 
         pts_ = pts.reshape(batch_size, n_samples, -1)  # N_rays, N_samples, c
         a_embedded_ = a_embedded.unsqueeze(1).expand(
@@ -694,43 +621,13 @@ class LightNeuconWRenderer:
         static_out = self.lightneuconw(inputs)
         rgb, inv_s, sdf, gradients , sigma , shadow= static_out
 
-        ##### output of NeRF-OSR
-        fg_normal_map = torch.autograd.grad(
-                outputs=sigma,
-                inputs=pts_,
-                grad_outputs=torch.ones_like(sigma, requires_grad=False),
-                retain_graph=True,
-                create_graph=True)[0]
-        fg_alpha = 1. - torch.exp(-sigma * dists)  # [..., N_samples]
-        T = torch.cumprod(1. - fg_alpha + 1e-6, dim=-1)  # [..., N_samples]
-        bg_lambda = T[..., -1]
-        T = torch.cat((torch.ones_like(T[..., 0:1]), T[..., :-1]), dim=-1)  # [..., N_samples]
-        fg_weights = fg_alpha * T  # [..., N_samples]
-
-        fg_albedo_map = torch.sum(fg_weights.unsqueeze(-1) * rgb, dim=-2)  # [..., 3]
-        fg_shadow_map = torch.sum(fg_weights.unsqueeze(-1) * shadow, dim=-2)  # [..., 3]
-
-        fg_depth_map = torch.sum(fg_weights * z_vals, dim=-1) 
-        fg_normal_map = (fg_normal_map * fg_weights.unsqueeze(-1)).mean(-2)
-        fg_normal_map = F.normalize(fg_normal_map, p=2, dim=-1)
-
-        # foreground color map
-        irradiance = self.illuminate_vec(fg_normal_map, env)
-        irradiance = torch.relu(irradiance)  # can't be < 0
-        irradiance = irradiance ** (1 / 2.2)  # linear to srgb
-        fg_pure_rgb_map = irradiance * fg_albedo_map
-        fg_rgb_map = fg_pure_rgb_map * fg_shadow_map
-
-
         true_cos = (dirs * gradients.reshape(-1, 3)).sum(-1, keepdim=True)
-
         # "cos_anneal_ratio" grows from 0 to 1 in the beginning training iterations. The anneal strategy below makes
         # the cos value "not dead" at the beginning training iterations, for better convergence.
         iter_cos = -(
             F.relu(-true_cos * 0.5 + 0.5) * (1.0 - cos_anneal_ratio)
             + F.relu(-true_cos) * cos_anneal_ratio
         )  # always non-positive
-
         # print("prev_cdf shape: ", sdf.size(), dists.reshape(-1, 1).size())
         # Estimate signed distances at section points
         estimated_next_sdf = sdf.reshape(-1, 1) + iter_cos * dists.reshape(-1, 1) * 0.5
@@ -754,96 +651,79 @@ class LightNeuconWRenderer:
         # print("depth", torch.min(depth), torch.max(depth))
         # print("mid_z_vals", torch.min(mid_z_vals), torch.max(mid_z_vals))
 
-        alpha = alpha * inside_sphere
+        ##### output of NeRF-OSR
+        fg_normal_map = torch.autograd.grad(
+                outputs=sigma,
+                inputs=pts_,
+                grad_outputs=torch.ones_like(sigma, requires_grad=False),
+                retain_graph=True,
+                create_graph=True)[0]
+        fg_alpha = 1. - torch.exp(-sigma * dists)  # [..., N_samples]
+
+        fg_alpha=fg_alpha*inside_sphere
         rgb = rgb * inside_sphere[:, :, None]
-        alpha_in_sphere = alpha
-        sphere_rgb = rgb
+
+        T = torch.cumprod(1. - fg_alpha + 1e-6, dim=-1)  # [..., N_samples]
+        bg_lambda = T[..., -1]
+        T = torch.cat((torch.ones_like(T[..., 0:1]), T[..., :-1]), dim=-1)  # [..., N_samples]
+        fg_weights = fg_alpha * T  # [..., N_samples]
+
+        fg_albedo_map = torch.sum(fg_weights.unsqueeze(-1) * rgb, dim=-2)  # [..., 3]
+        fg_shadow_map = torch.sum(fg_weights.unsqueeze(-1) * shadow, dim=-2)  # [..., 3]
+
+        fg_depth_map = torch.sum(fg_weights * z_vals, dim=-1) 
+        fg_normal_map = (fg_normal_map * fg_weights.unsqueeze(-1)).mean(-2)
+        fg_normal_map = F.normalize(fg_normal_map, p=2, dim=-1)
+
+        # foreground color map
+        irradiance = self.illuminate_vec(fg_normal_map, env)
+        irradiance = torch.relu(irradiance)  # can't be < 0
+        irradiance = irradiance ** (1 / 2.2)  # linear to srgb
+        fg_pure_rgb_map = irradiance * fg_albedo_map
+        fg_rgb_map = fg_pure_rgb_map * fg_shadow_map
+
 
         # Render with background
-        if background_alpha is not None:
-            if self.save_sample:
-                self.itr += 1
-                # save sampled points as point cloud
-                filter = (pts_norm < 1.0).view(-1, 1)
-                filter_all = filter.repeat(1, 3)
-                # print(f'filter_all size {filter_all.size()}')
-                inside_pts = (pts[filter_all] * self.radius).view(-1, 3) + self.origin
-                # print(f'filter_all val {filter_all}')
-                outside_pts = (pts[~filter_all] * self.radius).view(-1, 3) + self.origin
-                # print(f'total num{pts.size()}, insides num {inside_pts.size()}, outside num {outside_pts.size()}')
-                # print(torch.max(pts_norm), torch.min(pts_norm), torch.sum(filter), torch.sum(1 - filter.long()))
-                if self.insiders is None:
-                    self.insiders = inside_pts
-                    self.outsiders = outside_pts
-                else:
-                    self.insiders = torch.cat([self.insiders, inside_pts], dim=0)
-                    self.outsiders = torch.cat([self.outsiders, outside_pts], dim=0)
+        if self.render_bg:
+            bg_z_vals=z_vals_outside
+            N_samples = bg_z_vals.shape[-1]
+            bg_ray_o = ray_o.unsqueeze(-2).expand(dots_sh + [N_samples, 3])
+            bg_ray_d = ray_d.unsqueeze(-2).expand(dots_sh + [N_samples, 3])
+            bg_viewdirs = viewdirs.unsqueeze(-2).expand(dots_sh + [N_samples, 3])
+            bg_pts, _ = depth2pts_outside(bg_ray_o, bg_ray_d, bg_z_vals) 
 
-                if self.itr % 200 == 0:
-                    print("Saving samples...")
-                    inside_pcd = o3d.geometry.PointCloud()
-                    inside_pcd.points = o3d.utility.Vector3dVector(
-                        self.insiders.detach().cpu().numpy()
-                    )
-                    o3d.io.write_point_cloud(
-                        f"samples/inside_pts_sphere_{self.itr}.ply", inside_pcd
-                    )
+            inputs=torch.cat((bg_pts,_bg_ray_d,a_embedded_),dim=-1)
+            inputs = torch.flip(inputs, dims=[-2, ])
 
-                    outside_pcd = o3d.geometry.PointCloud()
-                    outside_pcd.points = o3d.utility.Vector3dVector(
-                        self.outsiders.detach().cpu().numpy()
-                    )
-                    o3d.io.write_point_cloud(
-                        f"samples/outside_sphere.ply_{self.itr}.ply", outside_pcd
-                    )
+            bg_z_vals = torch.flip(bg_z_vals, dims=[-1, ]) 
+            bg_dists = bg_z_vals[..., :-1] - bg_z_vals[..., 1:]
+            bg_dists = torch.cat((bg_dists, 1e10 * torch.ones_like(bg_dists[..., 0:1])), dim=-1)  
+            bg_sigma,bg_rgb = self.bg_model(inputs)
+            bg_alpha = 1. - torch.exp(-bg_sigma * bg_dists)  
+            
+            T = torch.cumprod(1. - bg_alpha + 1e-6, dim=-1)[..., :-1]  
+            T = torch.cat((torch.ones_like(T[..., 0:1]), T), dim=-1) 
+            bg_weights = bg_alpha * T  
 
-                    # clear cache
-                    self.insiders = None
-                    self.outsiders = None
+            bg_rgb_map = torch.sum(bg_weights.unsqueeze(-1) * bg_rgb, dim=-2) 
+            bg_depth_map = torch.sum(bg_weights * bg_z_vals, dim=-1) 
 
-            # # print("background processed")
-            alpha = alpha * inside_sphere + background_alpha[:, :n_samples] * (
-                1.0 - inside_sphere
-            )
-            alpha = torch.cat([alpha, background_alpha[:, n_samples:]], dim=-1)
-            rgb = (
-                rgb * inside_sphere[:, :, None]
-                + background_sampled_color[:, :n_samples]
-                * (1.0 - inside_sphere)[:, :, None]
-            )
-            rgb = torch.cat([rgb, background_sampled_color[:, n_samples:]], dim=1)
+            bg_rgb_map = bg_lambda.unsqueeze(-1) * bg_rgb_map
+            bg_depth_map = bg_lambda * bg_depth_map
 
-            # render background
-            if self.trim_sphere:
-                background_alpha[:, :n_samples] = torch.zeros_like(
-                    alpha[:, :n_samples]
-                ) + background_alpha[:, :n_samples] * (1.0 - inside_sphere)
-            transmittance_bg = torch.cumprod(
-                torch.cat(
-                    [
-                        torch.ones([batch_size, 1], device=device),
-                        1.0 - background_alpha + 1e-7,
-                    ],
-                    -1,
-                ),
-                -1,
-            )[:, :-1]
-            weights_bg = background_alpha * transmittance_bg
-            color_bg = (background_sampled_color * weights_bg[:, :, None]).sum(dim=1)
+            color = fg_rgb_map + bg_rgb_map
         else:
-            color_bg = None
+            bg_rgb_map = fg_rgb_map*0
+            bg_depth_map = fg_depth_map*0
+            bg_weights = fg_weights*0
 
-        transmittance = torch.cumprod(
-            torch.cat(
-                [torch.ones([batch_size, 1], device=device), 1.0 - alpha + 1e-7], -1
-            ),
-            -1,
-        )[:, :-1]
-        weights = alpha * transmittance
+            color = fg_rgb_map + bg_rgb_map*0
+        
         # weights_sum_s = weights_s.sum(dim=-1, keepdim=True)
         # only calculate weights inside sphere
-        weights_sum = (weights[:, :n_samples] * inside_sphere).sum(dim=-1, keepdim=True)
-
+        weights_sum = (fg_weights[:, :n_samples] * inside_sphere).sum(dim=-1, keepdim=True)
+        alpha_in_sphere = alpha
+        sphere_rgb = rgb
         sphere_transmittance = torch.cumprod(
             torch.cat(
                 [
@@ -858,12 +738,7 @@ class LightNeuconWRenderer:
         color_sphere = (sphere_rgb * weights_sphere[:, :, None]).sum(dim=1)
 
         # rendered normal
-        normals = (gradients * weights[:, :n_samples, None]).sum(dim=1)
-
-        color = (rgb * weights[:, :, None]).sum(dim=1)
-
-        if background_rgb is not None:  # Fixed background, usually black
-            color = fg_rgb_map + background_rgb
+        normals = (gradients * fg_weights[:, :n_samples, None]).sum(dim=1)
 
         # Eikonal loss
         gradient_error = (
@@ -942,35 +817,14 @@ class LightNeuconWRenderer:
                 rays_o, rays_d, near, far, perturb
             )
 
-        background_alpha = None
-        background_sampled_color = None
-
-        # Background model
-        if self.render_bg and self.n_outside > 0:
-            z_vals_feed = torch.cat([z_vals, z_vals_outside], dim=-1)
-            z_vals_feed, _ = torch.sort(z_vals_feed, dim=-1)
-            ret_outside = self.render_core_outside(
-                rays_o,
-                rays_d,
-                z_vals_feed,
-                sample_dist,
-                self.nerf,
-                a_embedded=a_embedded,
-            )
-
-            background_sampled_color = ret_outside["sampled_color"]
-            background_alpha = ret_outside["alpha"]
-
         # Render core
         ret_fine = self.render_core(
             rays_o,
             rays_d,
             z_vals,
+            z_vals_outside,
             sample_dist,
             a_embedded,
-            background_rgb=background_rgb,
-            background_alpha=background_alpha,
-            background_sampled_color=background_sampled_color,
             cos_anneal_ratio=cos_anneal_ratio,
         )
 
