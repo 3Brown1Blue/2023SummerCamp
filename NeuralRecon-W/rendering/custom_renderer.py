@@ -585,7 +585,7 @@ class LightNeuconWRenderer:
         d2 = torch.sqrt(1. - p_norm_sq) * ray_d_cos
 
         return d1 + d2
-    def illuminate_vec(n, env):
+    def illuminate_vec(self,n, env):
         c1 = 0.282095
         c2 = 0.488603
         c3 = 1.092548
@@ -644,7 +644,7 @@ class LightNeuconWRenderer:
         rays_d_ = rays_d.unsqueeze(1).expand(-1, n_samples, -1)  # N_rays, N_samples, c
 
         ### foreground far depth
-        z_max=self.intersect_sphere(rays_o,rays_d)
+        # z_max=self.intersect_sphere(rays_o,rays_d)
 
         ### default env
         env = torch.tensor([
@@ -677,7 +677,7 @@ class LightNeuconWRenderer:
                 # [-0.1569444, -0.0954703, -0.1485053],
                 # [0.5646247, 0.2161586, 0.1402643],
                 # [0.2137442, -0.0547578, -0.3061700]
-            ], dtype=torch.float32)
+            ], dtype=torch.float32,device=device)
         env_gray=env[..., 0]*0.2126 + env[..., 1]*0.7152 + env[..., 2]*0.0722
 
         # get sph for shadows
@@ -685,12 +685,13 @@ class LightNeuconWRenderer:
         sph=sph+torch.randn_like(sph)*0.01
         
         ##### inputs for LightNeuconW
+        pts_.requires_grad_(True)
         inputs=torch.cat((pts_,rays_d_,a_embedded_,sph),dim=-1)
         
         # print([it.size() for it in inputs])
 
         ##### output of LightNeuconW
-        static_out = self.lightneuconw(torch.cat(inputs, -1))
+        static_out = self.lightneuconw(inputs)
         rgb, inv_s, sdf, gradients , sigma , shadow= static_out
 
         ##### output of NeRF-OSR
