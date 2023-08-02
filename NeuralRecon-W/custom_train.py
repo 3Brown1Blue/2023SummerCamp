@@ -76,13 +76,14 @@ class LightNeuconWSystem(LightningModule):
             layers=8, 
             hidden=256,
             skips=[4],
-            in_channels_xyz=63, 
+            in_channels_xyz=84, 
             in_channels_dir=27,
             in_channels_a=48,
             in_channels_sph=9,
             in_channels_t=16,
             N_emb_xyz=10,
-            N_emb_dir=4 
+            N_emb_dir=4,
+            input_dim_xyz=4
         )
 
         self.anneal_end = self.config.NEUCONW.ANNEAL_END
@@ -340,7 +341,7 @@ class LightNeuconWSystem(LightningModule):
         results = self(rays, ts, label)
         loss_d = self.loss(results, rgbs,self.global_step)
         loss = sum(l for l in loss_d.values())
-
+        
         with torch.no_grad():
             psnr_ = psnr(results[f"color"], rgbs)
 

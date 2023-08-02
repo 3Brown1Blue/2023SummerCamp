@@ -8,9 +8,11 @@ from models.neuconw import SDFNetwork,SingleVarianceNetwork
 
 # xyz and dir embedding
 class PosEmbedding(nn.Module):
-    def __init__(self, max_logscale, N_freqs, logscale=True):
+    def __init__(self, max_logscale, N_freqs, input_dim=3,logscale=True):
         super().__init__()
         self.funcs = [torch.sin, torch.cos]
+        self.input_dim=input_dim
+        self.output_dim=self.input_dim*len(self.funcs)*N_freqs+input_dim
 
         if logscale:
             self.freqs = 2**torch.linspace(0, max_logscale, N_freqs)
@@ -18,14 +20,14 @@ class PosEmbedding(nn.Module):
             self.freqs = torch.linspace(1, 2**max_logscale, N_freqs)
 
     def forward(self, x):
-        # dim_in:(B,3)
+        # dim_in:(B,input_dim)
         out = [x]
 
         for freq in self.freqs:
             for func in self.funcs:
                 out += [func(freq*x)]
 
-        # dim_out:(B, 6*N_freqs+3)
+        # dim_out:(B, num_funcs*input_dim*N_freqs+input_dim)
         return torch.cat(out, -1)
 
 class LightCodeNetwork(nn.Module):
@@ -44,7 +46,9 @@ class LightCodeNetwork(nn.Module):
             in_channels_sph=9,
             in_channels_t=16,
             N_emb_xyz=10,
-            N_emb_dir=4 
+            N_emb_dir=4,
+            input_dim_xyz=3,
+            input_dim_dir=3
         ):
         super().__init__()
         self.flag=flag
@@ -53,6 +57,8 @@ class LightCodeNetwork(nn.Module):
         self.skips=skips
         self.in_channels_xyz=in_channels_xyz
         self.in_channels_dir=in_channels_dir
+        self.input_dim_xyz=input_dim_xyz
+        self.input_dim_dir=input_dim_dir
         
         if flag=='fine':
             self.encode_shadow=encode_shadow
@@ -70,8 +76,8 @@ class LightCodeNetwork(nn.Module):
             self.in_channels_sph=0
         
         # points & views embedding
-        self.xyz_embedding=PosEmbedding(N_emb_xyz-1,N_emb_xyz)
-        self.dir_embedding=PosEmbedding(N_emb_dir-1,N_emb_dir)
+        self.xyz_embedding=PosEmbedding(N_emb_xyz-1,N_emb_xyz,input_dim_xyz)
+        self.dir_embedding=PosEmbedding(N_emb_dir-1,N_emb_dir,input_dim_dir)
 
         ## static 
         # xyz-encoder
@@ -160,7 +166,6 @@ class LightCodeNetwork(nn.Module):
         transient_beta = self.transient_beta(transient_encoding) # B*1
 
         return static_sigma,static_rgb,transient_sigma,transient_beta,transient_rgb
-
 
 '''
     NeRFOSR: recurrented from paper {NeRF for Outdoor Scene Relighting},ECCV 2022  

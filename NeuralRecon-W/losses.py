@@ -70,8 +70,8 @@ class LightNeuconWLoss(nn.Module):
         mask_sum = masks.sum() + 1e-5
         color_error = (inputs['color'] - targets) * masks
         ret['color_loss'] = torch.nn.functional.l1_loss(color_error, torch.zeros_like(color_error), reduction='sum') / mask_sum
-        ret['shadow_reg'] = torch.mean((1-inputs['shadow'])**2)*0.01* \
-                            np.clip((global_step-10000)/20000,0,1)
+        # ret['shadow_reg'] = torch.mean((1-inputs['shadow'])**2)*0.01* \
+        #                     np.clip((global_step-10000)/20000,0,1)
 
         ret['normal_loss'] = self.igr_weight * inputs['gradient_error'].mean()
 

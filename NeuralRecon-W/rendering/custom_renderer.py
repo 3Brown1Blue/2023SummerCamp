@@ -534,6 +534,36 @@ class LightNeuconWRenderer:
             c[8] * c5*(x*x-y*y)
         )
         return irradiance
+    def depth2pts_outside(self,ray_o, ray_d, depth):
+        '''
+        ray_o, ray_d: [..., 3]
+        depth: [...]; inverse of distance to sphere origin
+        '''
+        # note: d1 becomes negative if this mid point is behind camera
+        d1 = -torch.sum(ray_d * ray_o, dim=-1) / torch.sum(ray_d * ray_d, dim=-1)+1e-6
+        p_mid = ray_o + d1.unsqueeze(-1) * ray_d
+        p_mid_norm = torch.norm(p_mid, dim=-1)
+        ray_d_cos = 1. / torch.norm(ray_d, dim=-1)+1e-6
+        d2 = torch.sqrt(1. - p_mid_norm * p_mid_norm) * ray_d_cos
+        p_sphere = ray_o + (d1 + d2).unsqueeze(-1) * ray_d
+
+        rot_axis = torch.cross(ray_o, p_sphere, dim=-1)
+        rot_axis = rot_axis / torch.norm(rot_axis, dim=-1, keepdim=True)+1e-6
+        phi = torch.asin(p_mid_norm)
+        theta = torch.asin(p_mid_norm * depth)  # depth is inside [0, 1]
+        rot_angle = (phi - theta).unsqueeze(-1)  # [..., 1]
+
+        # now rotate p_sphere
+        # Rodrigues formula: https://en.wikipedia.org/wiki/Rodrigues%27_rotation_formula
+        p_sphere_new = p_sphere * torch.cos(rot_angle) + \
+                    torch.cross(rot_axis, p_sphere, dim=-1) * torch.sin(rot_angle) + \
+                    rot_axis * torch.sum(rot_axis * p_sphere, dim=-1, keepdim=True) * (1. - torch.cos(rot_angle))
+        p_sphere_new = p_sphere_new / torch.norm(p_sphere_new, dim=-1, keepdim=True)+1e-6
+        pts = torch.cat((p_sphere_new, depth.unsqueeze(-1)), dim=-1)
+
+        # now calculate conventional depth
+        depth_real = 1. / (depth + 1e-6) * torch.cos(theta) * ray_d_cos + d1
+        return pts, depth_real
 
     def render_core(
         self,
@@ -548,6 +578,8 @@ class LightNeuconWRenderer:
         batch_size, n_samples = z_vals.shape
         device = rays_o.device
 
+        dots_sh = list(rays_d.shape[:-1])
+
         # Section length
         dists = z_vals[..., 1:] - z_vals[..., :-1]
         dists = torch.cat([dists, sample_dist.expand(dists[..., -1:].shape)], -1)
@@ -557,12 +589,14 @@ class LightNeuconWRenderer:
         pts = (
             rays_o[:, None, :] + rays_d[:, None, :] * mid_z_vals[..., :, None]
         )  # n_rays, n_samples, 3
+        dirs = rays_d[:, None, :].expand(pts.shape)
+
         ray_d_norm = torch.norm(rays_d, dim=-1, keepdim=True)
         viewdirs = rays_d/ray_d_norm
-        viewdirs=viewdirs[:, None, :].expand((batch_size, n_samples,3))
+        viewdirs_=viewdirs[:, None, :].expand((batch_size, n_samples,3))
 
         pts = pts.reshape(-1, 3)
-        dirs = rays_d[:, None, :].expand((batch_size, n_samples,3))
+        dirs= dirs.reshape(-1,3)
 
         pts_ = pts.reshape(batch_size, n_samples, -1)  # N_rays, N_samples, c
         a_embedded_ = a_embedded.unsqueeze(1).expand(
@@ -682,23 +716,32 @@ class LightNeuconWRenderer:
         fg_pure_rgb_map = irradiance * fg_albedo_map
         fg_rgb_map = fg_pure_rgb_map * fg_shadow_map
 
-
         # Render with background
         if self.render_bg:
             bg_z_vals=z_vals_outside
             N_samples = bg_z_vals.shape[-1]
-            bg_ray_o = ray_o.unsqueeze(-2).expand(dots_sh + [N_samples, 3])
-            bg_ray_d = ray_d.unsqueeze(-2).expand(dots_sh + [N_samples, 3])
-            bg_viewdirs = viewdirs.unsqueeze(-2).expand(dots_sh + [N_samples, 3])
-            bg_pts, _ = depth2pts_outside(bg_ray_o, bg_ray_d, bg_z_vals) 
+            bg_ray_o = rays_o.unsqueeze(-2).expand(dots_sh + [N_samples, 3])
+            bg_ray_d = rays_d.unsqueeze(-2).expand(dots_sh + [N_samples, 3])
 
-            inputs=torch.cat((bg_pts,_bg_ray_d,a_embedded_),dim=-1)
+            bg_pts, _ = self.depth2pts_outside(bg_ray_o, bg_ray_d, bg_z_vals) 
+            a_embedded_ = a_embedded.unsqueeze(1).expand(
+                -1, N_samples, -1
+            )
+            viewdirs_=viewdirs[:, None, :].expand((batch_size, N_samples,3))
+
+            inputs=torch.cat((bg_pts,bg_ray_d,a_embedded_),dim=-1)
             inputs = torch.flip(inputs, dims=[-2, ])
 
             bg_z_vals = torch.flip(bg_z_vals, dims=[-1, ]) 
             bg_dists = bg_z_vals[..., :-1] - bg_z_vals[..., 1:]
             bg_dists = torch.cat((bg_dists, 1e10 * torch.ones_like(bg_dists[..., 0:1])), dim=-1)  
-            bg_sigma,bg_rgb = self.bg_model(inputs)
+            bg_sigma,bg_rgb = self.bg_model(
+                bg_pts.view(-1,4),
+                viewdirs_.reshape(-1,3),
+                a_embedded_.reshape(batch_size*N_samples,-1)
+            )
+            bg_sigma=bg_sigma.view(batch_size,N_samples)
+            bg_rgb=bg_rgb.view(batch_size,N_samples,3)
             bg_alpha = 1. - torch.exp(-bg_sigma * bg_dists)  
             
             T = torch.cumprod(1. - bg_alpha + 1e-6, dim=-1)[..., :-1]  
@@ -712,6 +755,7 @@ class LightNeuconWRenderer:
             bg_depth_map = bg_lambda * bg_depth_map
 
             color = fg_rgb_map + bg_rgb_map
+            # print(fg_rgb_map,bg_rgb_map)
         else:
             bg_rgb_map = fg_rgb_map*0
             bg_depth_map = fg_depth_map*0
@@ -755,12 +799,12 @@ class LightNeuconWRenderer:
             "color": color,
             "color_sphere": color_sphere,
             "shadow":fg_shadow_map,
-            "color_bg": color_bg if color_bg is not None else torch.zeros_like(color),
+            "color_bg": bg_rgb_map if bg_rgb_map is not None else torch.zeros_like(color),
             "sdf": sdf,
             "dists": dists,
             "s_val": 1.0 / inv_s,
             "mid_z_vals": mid_z_vals,
-            "weights": weights,
+            "weights":fg_weights,
             "weights_sum": weights_sum,
             "cdf": c.reshape(batch_size, n_samples),
             "inside_sphere": inside_sphere,
@@ -827,6 +871,7 @@ class LightNeuconWRenderer:
             a_embedded,
             cos_anneal_ratio=cos_anneal_ratio,
         )
+        # print(ret_fine)
 
         color = ret_fine["color"]
         weights = ret_fine["weights"]
