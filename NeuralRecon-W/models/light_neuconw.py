@@ -8,9 +8,11 @@ from models.neuconw import SDFNetwork,SingleVarianceNetwork
 
 # xyz and dir embedding
 class PosEmbedding(nn.Module):
-    def __init__(self, max_logscale, N_freqs, logscale=True):
+    def __init__(self, max_logscale, N_freqs, input_dim=3,logscale=True):
         super().__init__()
         self.funcs = [torch.sin, torch.cos]
+        self.input_dim=input_dim
+        self.output_dim=self.input_dim*len(self.funcs)*N_freqs+input_dim
 
         if logscale:
             self.freqs = 2**torch.linspace(0, max_logscale, N_freqs)
@@ -18,31 +20,35 @@ class PosEmbedding(nn.Module):
             self.freqs = torch.linspace(1, 2**max_logscale, N_freqs)
 
     def forward(self, x):
-        # dim_in:(B,3)
+        # dim_in:(B,input_dim)
         out = [x]
 
         for freq in self.freqs:
             for func in self.funcs:
                 out += [func(freq*x)]
 
-        # dim_out:(B, 6*N_freqs+3)
+        # dim_out:(B, num_funcs*input_dim*N_freqs+input_dim)
         return torch.cat(out, -1)
 
 class LightCodeNetwork(nn.Module):
     def __init__(
             self,
             flag,
+            encode_shadow=True,
             encode_appearance=False, 
             encode_transient=False, 
             layers=8, 
-            hidden=256, 
+            hidden=256,
             skips=[4],
             in_channels_xyz=63, 
             in_channels_dir=27,
             in_channels_a=48,
+            in_channels_sph=9,
             in_channels_t=16,
             N_emb_xyz=10,
-            N_emb_dir=4 
+            N_emb_dir=4,
+            input_dim_xyz=3,
+            input_dim_dir=3
         ):
         super().__init__()
         self.flag=flag
@@ -51,21 +57,27 @@ class LightCodeNetwork(nn.Module):
         self.skips=skips
         self.in_channels_xyz=in_channels_xyz
         self.in_channels_dir=in_channels_dir
+        self.input_dim_xyz=input_dim_xyz
+        self.input_dim_dir=input_dim_dir
         
         if flag=='fine':
+            self.encode_shadow=encode_shadow
             self.encode_appearance=encode_appearance
             self.encode_transient=encode_transient
             self.in_channels_a=in_channels_a
             self.in_channels_t=in_channels_t
+            self.in_channels_sph=in_channels_sph
         else:
+            self.encode_shadow=False
             self.encode_appearance=False
             self.encode_transient=False
             self.in_channels_a=0
             self.in_channels_t=0
+            self.in_channels_sph=0
         
         # points & views embedding
-        self.xyz_embedding=PosEmbedding(N_emb_xyz-1,N_emb_xyz)
-        self.dir_embedding=PosEmbedding(N_emb_dir-1,N_emb_dir)
+        self.xyz_embedding=PosEmbedding(N_emb_xyz-1,N_emb_xyz,input_dim_xyz)
+        self.dir_embedding=PosEmbedding(N_emb_dir-1,N_emb_dir,input_dim_dir)
 
         ## static 
         # xyz-encoder
@@ -85,24 +97,39 @@ class LightCodeNetwork(nn.Module):
                     [[nn.Linear(hidden//2,hidden//2),nn.ReLU(True)] for _ in range(layers//2)]
         self.dir_a_encoder=nn.Sequential(*sum(dir_a_encoder,[]))
 
+        # shadow layers
+        if self.encode_shadow:
+            shadow_layers=[]
+            dim=in_channels_sph+hidden
+            for i in range(1):
+                shadow_layers.append(nn.Linear(dim,hidden//2))
+                shadow_layers.append(nn.ReLU(True))
+                dim=hidden//2
+            shadow_layers.append(nn.Linear(dim,1))
+            shadow_layers.append(nn.Sigmoid())
+            self.shadow_layers=nn.Sequential(*shadow_layers)
+
         # static output layers
         self.static_sigma = nn.Sequential(nn.Linear(hidden, 1), nn.Softplus())
         self.static_rgb = nn.Sequential(nn.Linear(hidden//2, 3), nn.Sigmoid())
 
-        ## transient
+        ## transient(not adding shadow yet)
         if self.encode_transient:
             # transient-encoder
-            self.transient_encoder = nn.Sequential(
-                                        nn.Linear(hidden+in_channels_t, hidden//2), nn.ReLU(True),
-                                        nn.Linear(hidden//2, hidden//2), nn.ReLU(True),
-                                        nn.Linear(hidden//2, hidden//2), nn.ReLU(True),
-                                        nn.Linear(hidden//2, hidden//2), nn.ReLU(True))
+            transient_layers=[]
+            dim=hidden+in_channels_t
+            for i in range(4):
+                transient_layers.append(nn.Linear(dim,hidden//2))
+                transient_layers.append(nn.ReLU(True))
+                dim=hidden//2
+            self.transient_encoder = nn.Sequential(*transient_layers)
+
             # transient output layers
             self.transient_sigma = nn.Sequential(nn.Linear(hidden//2, 1), nn.Softplus())
             self.transient_rgb = nn.Sequential(nn.Linear(hidden//2, 3), nn.Sigmoid())
             self.transient_beta = nn.Sequential(nn.Linear(hidden//2, 1), nn.Softplus())
 
-    def forward(self,input_xyz,views,input_a,input_t=None,output_transient=False):
+    def forward(self,input_xyz,views,input_a,input_sph=None,input_t=None,output_transient=False):
         # output the transient code or not
         input_xyz=self.xyz_embedding(input_xyz)
         views=self.dir_embedding(views)
@@ -111,27 +138,34 @@ class LightCodeNetwork(nn.Module):
         xyz_copy = input_xyz
         for i in range(self.layers):
             if i in self.skips:
-                xyz_copy = torch.cat([input_xyz, xyz_copy], 1)
+                xyz_copy = torch.cat([input_xyz, xyz_copy], -1)
             xyz_copy = getattr(self, f"xyz_encoder_{i+1}")(xyz_copy)
 
         static_sigma = self.static_sigma(xyz_copy) # B*1
 
         xyz_encoding_final = self.xyz_encoder_final(xyz_copy)
-        rgb_input = torch.cat([xyz_encoding_final, input_dir_a], 1)
+        rgb_input = torch.cat([xyz_encoding_final, input_dir_a], -1)
         rgb_input = self.dir_a_encoder(rgb_input)
         static_rgb = self.static_rgb(rgb_input) # B*3
 
-        if not output_transient:
-            return static_sigma,static_rgb
+        if input_sph is not None:
+            shadow=self.shadow_layers(torch.cat([xyz_encoding_final,input_sph],dim=-1))
+            shadow=shadow.repeat((1,)*(len(shadow.size())-1)+(3,))
 
-        transient_encoding_input = torch.cat([xyz_encoding_final, input_t], 1)
+        if not output_transient:
+            if self.encode_shadow and input_sph is not None:
+                return static_sigma,static_rgb,shadow
+            else:
+                return static_sigma,static_rgb
+
+        ### (not adding shadow yet)
+        transient_encoding_input = torch.cat([xyz_encoding_final, input_t], -1)
         transient_encoding = self.transient_encoder(transient_encoding_input)
         transient_sigma = self.transient_sigma(transient_encoding) # B*1
         transient_rgb = self.transient_rgb(transient_encoding) # B*3
         transient_beta = self.transient_beta(transient_encoding) # B*1
 
         return static_sigma,static_rgb,transient_sigma,transient_beta,transient_rgb
-
 
 '''
     NeRFOSR: recurrented from paper {NeRF for Outdoor Scene Relighting},ECCV 2022  
@@ -146,8 +180,6 @@ class LightCodeNetwork(nn.Module):
 class NeRFOSR(nn.Module):
     def __init__(self) :
         super().__init__()
-
-
 
 class LightNeuconW(nn.Module):
     def __init__(
@@ -182,9 +214,6 @@ class LightNeuconW(nn.Module):
         #     **self.lightcodeNet_config
         # )
         self.lightcode_net_fine = LightCodeNetwork(
-            flag='fine',
-            encode_appearance=True, 
-            encode_transient=False,
             **self.lightcodeNet_config
         )
 
@@ -199,8 +228,8 @@ class LightNeuconW(nn.Module):
 
     def forward(self, x):
         device = x.device
-        input_xyz, view_dirs, input_a = torch.split(
-            x, [3, 3, self.in_channels_a], dim=-1
+        input_xyz, view_dirs, input_a, input_sph= torch.split(
+            x, [3,3,self.in_channels_a,9], dim=-1
         )
         
         n_rays, n_samples, _ = input_xyz.size()
@@ -213,11 +242,12 @@ class LightNeuconW(nn.Module):
 
         # color prediction
         static_gradient = self.gradient(input_xyz)
-        static_sigma,static_rgb  = self.lightcode_net_fine(
+        static_sigma,static_rgb,shadow  = self.lightcode_net_fine(
             input_xyz.view(-1,3),
             view_dirs.view(-1,3),
-            input_a
-        )  # (B, 3)
+            input_a,
+            input_sph.view(-1,9)
+        )  # (B, 1+3+3)
 
         # sdf gradient
         static_deviation = self.deviation_network(torch.zeros([1, 3], device=device))[
@@ -231,6 +261,8 @@ class LightNeuconW(nn.Module):
             static_deviation,
             static_sdf.view(n_rays, n_samples),
             static_gradient.view(n_rays, n_samples, 3),
+            static_sigma.view(n_rays,n_samples),
+            shadow.view(n_rays,n_samples,3)
         )
 
         return static_out

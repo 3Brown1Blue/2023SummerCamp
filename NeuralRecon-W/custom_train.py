@@ -11,7 +11,7 @@ from datasets import dataset_dict
 from datasets.mask_utils import get_label_id_mapping
 
 # models
-from models.light_neuconw import LightNeuconW
+from models.light_neuconw import LightNeuconW,LightCodeNetwork
 from models.nerf import NeRF
 from rendering.custom_renderer import LightNeuconWRenderer
 
@@ -68,19 +68,22 @@ class LightNeuconWSystem(LightningModule):
         )
 
         # for background
-        self.nerf = NeRF(
-            D=8,
-            d_in=4,
-            d_in_view=3,
-            W=256,
-            multires=10,
-            multires_view=4,
-            output_ch=4,
+        self.bg_model = LightCodeNetwork(
+            flag='fine',
+            encode_shadow=True,
+            encode_appearance=False, 
+            encode_transient=False, 
+            layers=8, 
+            hidden=256,
             skips=[4],
-            encode_appearance=self.config.NEUCONW.ENCODE_A_BG,
-            in_channels_a=self.config.NEUCONW.N_A,
-            in_channels_dir=6 * self.config.NEUCONW.COLOR_CONFIG.multires_view + 3,
-            use_viewdirs=True,
+            in_channels_xyz=84, 
+            in_channels_dir=27,
+            in_channels_a=48,
+            in_channels_sph=9,
+            in_channels_t=16,
+            N_emb_xyz=10,
+            N_emb_dir=4,
+            input_dim_xyz=4
         )
 
         self.anneal_end = self.config.NEUCONW.ANNEAL_END
@@ -91,7 +94,7 @@ class LightNeuconWSystem(LightningModule):
             "min_track_length": self.scene_config["min_track_length"],
         }
         self.renderer = LightNeuconWRenderer(
-            nerf=self.nerf,
+            bg_model=self.bg_model,
             lightneuconw=self.lightneuconw,
             embeddings=self.embeddings,
             n_samples=self.config.NEUCONW.N_SAMPLES,
@@ -113,7 +116,7 @@ class LightNeuconWSystem(LightningModule):
             nerf_far_override=self.config.NEUCONW.NEAR_FAR_OVERRIDE,
         )
 
-        self.models = {"lightneuconw": self.lightneuconw, "nerf": self.nerf}
+        self.models = {"lightneuconw": self.lightneuconw, "bg_model": self.bg_model}
         self.models_to_train += [self.models]
         self.caches = caches
 
@@ -336,9 +339,9 @@ class LightNeuconWSystem(LightningModule):
         label = label[ray_mask]
 
         results = self(rays, ts, label)
-        loss_d = self.loss(results, rgbs)
+        loss_d = self.loss(results, rgbs,self.global_step)
         loss = sum(l for l in loss_d.values())
-
+        
         with torch.no_grad():
             psnr_ = psnr(results[f"color"], rgbs)
 
@@ -409,7 +412,7 @@ class LightNeuconWSystem(LightningModule):
                 results[k] += [v.detach()]
         for k, v in results.items():
             results[k] = torch.cat(v, dim=0)
-        loss_d = self.loss(results, rgbs)
+        loss_d = self.loss(results, rgbs,self.global_step)
         loss = sum(l for l in loss_d.values())
         log = {"val_loss": loss}
 
