@@ -167,6 +167,81 @@ class LightCodeNetwork(nn.Module):
 
         return static_sigma,static_rgb,transient_sigma,transient_beta,transient_rgb
 
+class SDFNetwork(nn.Module):
+    def __init__(
+        self,
+        d_in,
+        d_out,
+        d_hidden,
+        n_layers,
+        skip_in=(4,),
+        multires=6,
+        scale=1,
+        weight_norm=True,
+    ):
+        super().__init__()
+        self.d_in=d_in
+        self.d_out=d_out
+        self.d_hidden=d_hidden
+        self.n_layers=n_layers
+
+        dims = [d_in] + [d_hidden for _ in range(n_layers)] + [d_out]
+
+        self.embed_fn_fine = None
+        self.embedder=PosEmbedding(multires-1,multires,input_dim=d_in)
+
+        self.num_layers = len(dims)
+        self.skip_in = skip_in
+        self.scale = scale
+        self.multires = multires
+
+        for l in range(0, self.num_layers - 1):
+            if l + 1 in self.skip_in:
+                out_dim = dims[l + 1] - dims[0]
+            else:
+                out_dim = dims[l + 1]
+
+            lin = nn.Linear(dims[l], out_dim)
+
+            if weight_norm:
+                lin = nn.utils.weight_norm(lin)
+            setattr(self, "sdf_linear" + str(l), lin)
+
+        self.activation = nn.Softplus()
+
+    def forward(self, inputs):
+        inputs = inputs * self.scale
+        if self.embedder is not None:
+            inputs = self.embedder(inputs.reshape(-1, self.d_in))
+
+        x = inputs
+        for l in range(0, self.num_layers - 1):
+            lin = getattr(self, "sdf_linear" + str(l))
+
+            if l in self.skip_in:
+                x = torch.cat([x, inputs], 1) / np.sqrt(2)
+            x = lin(x)
+
+            if l < self.num_layers - 2:
+                x = self.activation(x)
+        return x
+
+    def sdf(self, x):
+        x.requires_grad_(True)
+        y = self.sdf(x)
+        d_output = torch.ones_like(y, requires_grad=False, device=y.device)
+        gradients = torch.autograd.grad(
+            outputs=y,
+            inputs=x,
+            grad_outputs=d_output,
+            create_graph=True,
+            retain_graph=True,
+            only_inputs=True,
+        )[0]
+
+        return self.forward(x)[:, :1],gradients.reshape(-1, 3)
+
+
 '''
     NeRFOSR: recurrented from paper {NeRF for Outdoor Scene Relighting},ECCV 2022  
     url:https://4dqv.mpi-inf.mpg.de/NeRF-OSR/  
